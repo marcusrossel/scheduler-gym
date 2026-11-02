@@ -39,7 +39,7 @@ def setup_style():
             #     legend_title=p9.element_blank(),
             #     plot_title=p9.element_text(size=11, weight="bold", ha="left"),
             #     plot_title_position="plot",
-            dpi=110,
+            dpi=300,
         )
     )
 
@@ -282,9 +282,10 @@ def _profile(
     fin: pl.DataFrame,
     log_x: bool,
     y_min: float,
+    nrow: int = len(RESOURCES),
 ) -> p9.ggplot:
     """Step curves from 0 at `lo` through `points` to `hi`, per case, resource and scheduler,
-    showing y from `y_min` to 1."""
+    showing y from `y_min` to 1, in `nrow` rows of facets."""
     group = ["case", "resource", "scheduler"]
     curves = pl.concat(
         [
@@ -297,7 +298,7 @@ def _profile(
     return (
         # curves that stay at 0 get no star
         _steps(curves, "y", ["case", "resource"], log_x, pl.col("y") > 0)
-        + _facets("resource", len(RESOURCES), "free_x")
+        + _facets("resource", nrow, "free_x")
         + p9.coord_cartesian(ylim=(y_min, 1))
     )
 
@@ -336,7 +337,8 @@ def solved_profile(
         .join(proofs.group_by(group).agg(pl.col("y").max()), on=group, how="left")
         .with_columns(pl.col("y").fill_null(0))
     )
-    return _profile(proofs, ends, fin, log_x, y_min) + p9.labs(
+    # a single case, so the resources go side by side
+    return _profile(proofs, ends, fin, log_x, y_min, nrow=1) + p9.labs(
         x="",
         y="runs with a proof",
         title=f"{case}: proving the goal",
