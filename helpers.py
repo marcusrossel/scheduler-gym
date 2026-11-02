@@ -6,6 +6,7 @@ from typing import Literal
 import matplotlib as mpl
 import plotnine as p9
 import polars as pl
+from matplotlib.path import Path as MplPath
 
 from gym import SCHEDULERS, Scheduler
 
@@ -24,9 +25,20 @@ COLORS: dict[Side, str] = {
     "other": "#999999",
 }
 SIDE = pl.Enum(COLORS.keys())
+# the scheduler the bar charts are relative to
+BASELINE: Scheduler = "backoff"
 # alpha of the curves and bars that are not the best of their side
 REST_ALPHA = 0.4
-TOP_NOTE = "opaque: backoff and the best lhs / rhs of each case"
+# marker for the break in cut bars: two slanted parallel strokes, like //
+BREAK = MplPath(
+    [(-0.6, -1), (-0.1, 1), (0.1, -1), (0.6, 1)],
+    [MplPath.MOVETO, MplPath.LINETO, MplPath.MOVETO, MplPath.LINETO],
+)
+TOP_NOTE = "opaque: backoff and the lhs / rhs with the lowest final cost of each case"
+BAR_NOTE = (
+    "opaque: the lhs / rhs with the lowest final cost of each case;\n"
+    f"// = bar cut off; the line at 0 is {BASELINE}"
+)
 
 RESOURCES: dict[Resource, str] = {"time": "time [s]", "size": "e-graph size"}
 METRICS: dict[Metric, str] = {"cost": "cost", **RESOURCES}
@@ -63,8 +75,8 @@ def save(plot: p9.ggplot, name: str, size: tuple[float, float]) -> p9.ggplot:
     return plot
 
 
-def load(root: Path = BENCHDATA) -> pl.DataFrame:
-    """One row per entry of every scheduler; `run` numbers the runs within a file. Unfinished trailing runs are dropped."""
+def load(*, root: Path = BENCHDATA) -> pl.DataFrame:
+    """One row per entry; `run` numbers the runs in a file, unfinished ones dropped."""
     rows = []
     for path in sorted(root.glob("*/*.entries")):
         case, scheduler = path.stem, path.parent.name.removesuffix(".rs")
@@ -86,18 +98,17 @@ def load(root: Path = BENCHDATA) -> pl.DataFrame:
 
 
 def select(
-    df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS
+    df: pl.DataFrame, *, schedulers: Sequence[Scheduler] = SCHEDULERS
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """The rows and `finals` of `schedulers`, ordered as given (fixes order in figures),
-    the finals with each scheduler's `side` and whether it is the `top` of it per case."""
+    """Rows and `finals` of `schedulers` in that order, finals with `side` and `top`."""
     df = df.filter(pl.col("scheduler").is_in(schedulers)).with_columns(
         pl.col("scheduler").cast(pl.String).cast(pl.Enum(schedulers))
     )
     fin = finals(df)
     name = pl.col("scheduler").cast(pl.String)
     side = name.str.extract(r"^detour-(lhs|rhs)-\d+$")
-    # backoff is always top; of lhs / rhs the best as in `ranking`, ties going to the
-    # smallest k
+    # backoff is always top; of lhs / rhs the one with the lowest geomean of final cost
+    # relative to the best final cost of each run, ties going to the smallest k
     top = (
         fin.group_by("case", "scheduler")
         .agg(ratio=_geomean(pl.col("cost") / pl.col("best")))
@@ -122,7 +133,7 @@ def select(
 
 
 def finals(df: pl.DataFrame) -> pl.DataFrame:
-    """One row per run: final cost, best final cost over all schedulers, and resources needed to reach it."""
+    """One row per run: final cost, the run's best final cost, resources to reach it."""
     last = df.group_by(KEY, maintain_order=True).last()
     last = last.with_columns(best=pl.col("cost").min().over("case", "run"))
 
@@ -136,9 +147,9 @@ def finals(df: pl.DataFrame) -> pl.DataFrame:
     return last.join(reached, on=KEY, how="left")
 
 
-def check_runs(df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS):
-    """Print the cases where `schedulers` have a different number of finished runs."""
-    _, fin = select(df, schedulers)
+def check_runs(df: pl.DataFrame, *, schedulers: Sequence[Scheduler] = SCHEDULERS):
+    """Print cases where `schedulers` have different numbers of finished runs."""
+    _, fin = select(df, schedulers=schedulers)
     counts = fin.group_by("case", "scheduler").len()
     for (case,), g in counts.group_by("case"):
         if g["len"].n_unique() > 1:
@@ -151,7 +162,7 @@ def _geomean(e: pl.Expr) -> pl.Expr:
 
 
 def _titled(d: pl.DataFrame, fin: pl.DataFrame) -> pl.DataFrame:
-    """`d` with `title` = case, number of runs and top lhs / rhs, for facet labels."""
+    """`d` with a facet `title`: case, runs, top lhs / rhs."""
     top = pl.col("top") & pl.col("side").is_in(["lhs", "rhs"])
     pick = pl.col("scheduler").cast(pl.String).str.replace(r"^detour-(\w+)-", "$1 ")
     runs = fin.group_by("case").agg(
@@ -166,7 +177,7 @@ def _titled(d: pl.DataFrame, fin: pl.DataFrame) -> pl.DataFrame:
 
 
 def _facets(by: str, n: int, scales: Literal["free", "free_x"]) -> p9.facet_wrap:
-    """One column per case (`title`), one row per value of `by`, of which there are `n`."""
+    """One column per case, `n` rows, one per value of `by`."""
     return p9.facet_wrap(
         ["title", by],
         nrow=n,
@@ -178,7 +189,7 @@ def _facets(by: str, n: int, scales: Literal["free", "free_x"]) -> p9.facet_wrap
 
 
 def _stars(d: pl.DataFrame, by: list[str], y: str) -> pl.DataFrame:
-    """Per group of `by` and scheduler, the first point where `y` reaches its final value."""
+    """First point per group and scheduler where `y` reaches its final value."""
     group = [*by, "scheduler"]
     last = pl.col(y).last().over(group)
     return (
@@ -195,10 +206,10 @@ def _steps(
     y: str,
     by: list[str],
     log_x: bool,
+    *,
     star_if: pl.Expr | bool = True,
 ) -> p9.ggplot:
-    """Step lines of `y` over `x` per group of `by` and scheduler, colored by side, the top
-    ones opaque with a star where they reach their final value (if matching `star_if`)."""
+    """Step lines per scheduler, top ones opaque, starred where final if `star_if`."""
     d = d.join(
         fin.select("case", "scheduler", "side", "top").unique(),
         on=["case", "scheduler"],
@@ -230,30 +241,57 @@ def _steps(
 
 
 def _bars(
-    d: pl.DataFrame, fin: pl.DataFrame, value: str, fmt: str, *, base: float = 0
+    d: pl.DataFrame, fin: pl.DataFrame, value: str, *, zoom: float = 100
 ) -> p9.ggplot:
-    """Horizontal bars per scheduler from `base` to `value`, labelled with it, colored by
-    side, the top ones opaque."""
+    """Bars of `value` per scheduler, cut at ±`zoom` with a // break.
+    Backoff is left out, it is the line at 0."""
     dtype = d["scheduler"].dtype
     assert isinstance(dtype, pl.Enum)
-    top_down = dtype.categories.reverse().to_list()
-    d = d.join(
-        fin.select("case", "scheduler", "side", "top").unique(),
-        on=["case", "scheduler"],
-    ).with_columns(base=pl.lit(base))
+    top_down = [s for s in dtype.categories.reverse() if s != BASELINE]
+    gain = pl.col(value) >= 0
+    # room for the labels past the bars, about a third of the case's range of bars
+    span = pl.max_horizontal(pl.col("end").max(), 0) - pl.min_horizontal(
+        pl.col("end").min(), 0
+    )
+    d = (
+        d.filter(pl.col("scheduler") != BASELINE)
+        .join(
+            fin.select("case", "scheduler", "side", "top").unique(),
+            on=["case", "scheduler"],
+        )
+        .with_columns(end=pl.col(value).clip(-zoom, zoom))
+        .with_columns(
+            reach=pl.col("end")
+            + pl.when(gain).then(0.3).otherwise(-0.3) * span.over("case"),
+            # where a cut bar is broken, a bit before its end
+            gap=pl.col("end")
+            - pl.when(gain).then(0.08).otherwise(-0.08) * span.over("case"),
+        )
+    )
+    d = d.with_columns(
+        text=pl.Series(f" {v:+.1f}%" if v >= 0 else f"{v:+.1f}% " for v in d[value])
+    )
     bar = p9.aes(yend="scheduler")
+    label = p9.aes(x="end", label="text")
     return (
-        p9.ggplot(d, p9.aes(y="scheduler", x="base", xend=value, color="side"))
+        p9.ggplot(d, p9.aes(y="scheduler", x=0, xend="end", color="side"))
+        + p9.geom_vline(xintercept=0, color=COLORS["backoff"], size=0.5)
+        + p9.geom_blank(p9.aes(x="reach"))
         + p9.geom_segment(bar, data=d.filter(~pl.col("top")), size=4, alpha=REST_ALPHA)
         + p9.geom_segment(bar, data=d.filter(pl.col("top")), size=4)
-        + p9.geom_text(
-            p9.aes(x=value, label=value),
-            format_string=f" {{:{fmt}}}",
-            ha="left",
-            size=7,
+        + p9.geom_point(
+            p9.aes(x="gap"),
+            data=d.filter(pl.col(value).abs() > zoom),
+            shape=BREAK,
+            size=5,
+            stroke=1.2,
+            color="white",
         )
+        + p9.geom_text(label, data=d.filter(gain), ha="left", size=7, color="black")
+        + p9.geom_text(label, data=d.filter(~gain), ha="right", size=7, color="black")
         + p9.scale_x_continuous(
-            labels=lambda xs: [f"{x:.3g}" for x in xs], expand=(0, 0, 0.25, 0)
+            labels=lambda xs: [f"{x:+.3g}%" if x else "0%" for x in xs],
+            expand=(0.02, 0),
         )
         + p9.scale_y_discrete(limits=top_down)
         + p9.scale_color_manual(values=COLORS)
@@ -264,21 +302,30 @@ def _bars(
 
 
 def ranking(
-    df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS
+    df: pl.DataFrame,
+    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    *,
+    zoom: float = 100,
 ) -> p9.ggplot:
-    """Geometric mean of final cost relative to the best scheduler per run (1 = always best)."""
-    _, fin = select(df, schedulers)
-    d = fin.group_by("case", "scheduler").agg(
-        ratio=_geomean(pl.col("cost") / pl.col("best"))
+    """Final cost reduction over backoff in percent, geomean over runs.
+    `zoom`: bars are cut off at ±`zoom` percent, their labels still give the value."""
+    _, fin = select(df, schedulers=schedulers)
+    base = fin.filter(pl.col("scheduler") == BASELINE).select(
+        "case", "run", base=pl.col("cost")
+    )
+    d = (
+        fin.join(base, on=["case", "run"])
+        .group_by("case", "scheduler")
+        .agg(gain=(1 - _geomean(pl.col("cost") / pl.col("base"))) * 100)
     )
     return (
-        _bars(_titled(d, fin), fin, "ratio", ".3f", base=1)
+        _bars(_titled(d, fin), fin, "gain", zoom=zoom)
         + p9.facet_wrap("title", nrow=1, scales="free")
         + p9.labs(
-            x="final cost / best final cost (geomean)",
-            title="Final cost relative to the best scheduler",
-            subtitle="geometric mean over runs, 1 = always the best; lower is better;"
-            f"\n{TOP_NOTE}",
+            x=f"final cost reduction over {BASELINE} [%]",
+            title=f"Final cost relative to {BASELINE}",
+            subtitle=f"1 − geomean over runs of final cost / {BASELINE}'s final cost;"
+            f" higher is better;\n{BAR_NOTE}",
         )
     )
 
@@ -288,28 +335,37 @@ def solved(
     schedulers: Sequence[Scheduler] = SCHEDULERS,
     *,
     solved_cost: float = 1,
+    zoom: float = 100,
 ) -> p9.ggplot:
-    """Number of runs per scheduler that ended at `solved_cost`, i.e. proved the goal, per
-    case of `df`, which are all proof cases."""
-    _, fin = select(df, schedulers)
+    """Change in runs that reached `solved_cost`, relative to backoff in percent.
+    `zoom`: bars are cut off at ±`zoom` percent, their labels still give the value."""
+    _, fin = select(df, schedulers=schedulers)
     d = fin.group_by("case", "scheduler").agg(
-        solved=(pl.col("cost") == solved_cost).sum(), runs=pl.len()
+        solved=(pl.col("cost") <= solved_cost).sum(), runs=pl.len()
+    )
+    base = d.filter(pl.col("scheduler") == BASELINE).select(
+        "case", base="solved", base_runs="runs"
+    )
+    for case, b, _ in base.iter_rows():
+        assert b > 0, f"{BASELINE} solved no runs of {case}"
+    bases = ", ".join(f"{c} {b} of {r}" for c, b, r in base.sort("case").iter_rows())
+    d = d.join(base, on="case").with_columns(
+        gain=(pl.col("solved") / pl.col("base") - 1) * 100
     )
     return (
-        _bars(_titled(d, fin), fin, "solved", "d")
-        # each case's axis reaches its number of runs
-        + p9.geom_blank(p9.aes(x="runs"))
+        _bars(_titled(d, fin), fin, "gain", zoom=zoom)
         + p9.facet_wrap("title", nrow=1, scales="free")
         + p9.labs(
-            x="solved runs",
+            x=f"more solved runs than {BASELINE} [%]",
             title="Proved goals",
-            subtitle=f"runs that ended at the goal; higher is better;\n{TOP_NOTE}",
+            subtitle=f"runs that proved the goal, relative to {BASELINE}'s;\n"
+            f"{BASELINE} solved {bases}; higher is better;\n{BAR_NOTE}",
         )
     )
 
 
 def _per_resource(df: pl.DataFrame, *cols: str) -> pl.DataFrame:
-    """`df` once per resource, with `x` its running maximum (the e-graph size can shrink)."""
+    """`df` once per resource, `x` its running max."""
     return pl.concat(
         df.select(
             *KEY,
@@ -327,10 +383,10 @@ def _profile(
     fin: pl.DataFrame,
     log_x: bool,
     y_min: float,
+    *,
     nrow: int = len(RESOURCES),
 ) -> p9.ggplot:
-    """Step curves from 0 at `lo` through `points` to `hi`, per case, resource and scheduler,
-    showing y from `y_min` to 1, in `nrow` rows of facets."""
+    """Step curves from 0 at `lo` through `points` to `hi`, y from `y_min` to 1."""
     group = ["case", "resource", "scheduler"]
     curves = pl.concat(
         [
@@ -342,7 +398,7 @@ def _profile(
     curves = _titled(curves, fin)
     return (
         # curves that stay at 0 get no star
-        _steps(curves, fin, "y", ["case", "resource"], log_x, pl.col("y") > 0)
+        _steps(curves, fin, "y", ["case", "resource"], log_x, star_if=pl.col("y") > 0)
         + _facets("resource", nrow, "free_x")
         + p9.coord_cartesian(ylim=(y_min, 1))
     )
@@ -356,10 +412,9 @@ def solved_profile(
     log_x: bool = False,
     y_min: float = 0,
 ) -> p9.ggplot:
-    """Fraction of runs per scheduler that reached `solved_cost` within a resource budget,
-    per case of `df`, which are all proof cases.
+    """Fraction of runs that reached `solved_cost` within a resource budget.
     `log_x`: log x axis; `y_min`: lower end of the y axis, to zoom in on high fractions."""
-    df, fin = select(df, schedulers)
+    df, fin = select(df, schedulers=schedulers)
     group = ["case", "resource", "scheduler"]
     d = _per_resource(df, "cost")
     runs = fin.group_by("case", "scheduler").agg(runs=pl.len())
@@ -396,7 +451,7 @@ def solved_profile(
 def _relative(
     df: pl.DataFrame, fin: pl.DataFrame, metric: Metric, absolute: bool = False
 ) -> pl.DataFrame:
-    """`df` with `rel` = `metric` / the run's smallest final `metric`, or `metric` if `absolute`."""
+    """`df` with `rel` = `metric` / the run's smallest final one (or `metric`)."""
     if absolute:
         return df.with_columns(rel=pl.col(metric))
     best = fin.group_by("case", "run").agg(best=pl.col(metric).min())
@@ -406,7 +461,7 @@ def _relative(
 
 
 def _grid(d: pl.DataFrame, by: list[str], log: bool, n: int = 300) -> pl.DataFrame:
-    """`n` evenly spaced `x` per group of `by`, spanning that group's `x`; log-spaced if `log`."""
+    """`n` evenly (or log-) spaced `x` per group of `by`."""
     lo, hi = pl.col("x").min(), pl.col("x").max()
     if log:
         lo, hi = lo.log(), hi.log()
@@ -415,8 +470,7 @@ def _grid(d: pl.DataFrame, by: list[str], log: bool, n: int = 300) -> pl.DataFra
 
 
 def _geomean_curves(d: pl.DataFrame, by: list[str], grid: pl.DataFrame) -> pl.DataFrame:
-    """Per group of `by` and scheduler, the geomean over runs of `rel` at each `x` of `grid`.
-    Outside its range, a run is held at its first / last `rel`."""
+    """Geomean of `rel` at each `x` of `grid`, runs held at their ends."""
     run = [*by, "scheduler", "run"]
     d = d.select(*run, "x", "rel").sort("x", maintain_order=True)
     starts = d.group_by(run).agg(start=pl.col("rel").first())
@@ -437,9 +491,9 @@ def quality(
     log_y: bool = False,
     absolute: bool = False,
 ) -> p9.ggplot:
-    """Geomean over runs of the cost relative to the run's best final cost, over resource.
+    """Cost relative to the run's best final cost over resource, geomean over runs.
     `log_x`/`log_y`: log axes; `absolute`: plain cost (only the y scale changes)."""
-    df, fin = select(df, schedulers)
+    df, fin = select(df, schedulers=schedulers)
     d = _per_resource(_relative(df, fin, "cost", absolute), "rel")
     by = ["case", "resource"]
     curves = _titled(_geomean_curves(d, by, _grid(d, by, log_x)), fin)
@@ -470,9 +524,9 @@ def dev(
     log_y: bool = False,
     absolute: bool = False,
 ) -> p9.ggplot:
-    """Geomean over runs of cost, time and size relative to the run's smallest final value.
+    """Cost, time and size relative to the run's smallest final one, per iteration.
     `log_x`/`log_y`: log axes; `absolute`: plain values (only the y scale changes)."""
-    df, fin = select(df, schedulers)
+    df, fin = select(df, schedulers=schedulers)
     d = pl.concat(
         _relative(df, fin, m, absolute).select(
             *KEY,
@@ -487,7 +541,9 @@ def dev(
     curves = _titled(_geomean_curves(d, by, grid), fin)
     return (
         # time and size only grow, so only the cost gets stars
-        _steps(curves, fin, "rel", by, log_x, pl.col("metric") == METRICS["cost"])
+        _steps(
+            curves, fin, "rel", by, log_x, star_if=pl.col("metric") == METRICS["cost"]
+        )
         + _facets("metric", len(METRICS), "free")
         + (p9.scale_y_log10() if log_y else p9.scale_y_continuous())
         + p9.labs(
