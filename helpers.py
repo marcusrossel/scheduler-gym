@@ -100,11 +100,22 @@ def load(*, root: Path = BENCHDATA) -> pl.DataFrame:
 def select(
     df: pl.DataFrame, *, schedulers: Sequence[Scheduler] = SCHEDULERS
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Rows and `finals` of `schedulers` in that order, finals with `side` and `top`."""
+    """Rows of `schedulers` in that order, and finals: one row per run with the final
+    cost, the run's best final cost, resources to reach it, `side` and `top`."""
     df = df.filter(pl.col("scheduler").is_in(schedulers)).with_columns(
         pl.col("scheduler").cast(pl.String).cast(pl.Enum(schedulers))
     )
-    fin = finals(df)
+    fin = df.group_by(KEY, maintain_order=True).last()
+    fin = fin.with_columns(best=pl.col("cost").min().over("case", "run"))
+    reached = (
+        df.join(fin.select(*KEY, "best"), on=KEY)
+        .filter(pl.col("cost") <= pl.col("best"))
+        .group_by(KEY, maintain_order=True)
+        .first()
+        .select(*KEY, *(pl.col(r).alias(f"{r}_to_best") for r in RESOURCES))
+    )
+    fin = fin.join(reached, on=KEY, how="left")
+
     name = pl.col("scheduler").cast(pl.String)
     side = name.str.extract(r"^detour-(lhs|rhs)-\d+$")
     # backoff is always top; of lhs / rhs the one with the lowest geomean of final cost
@@ -130,21 +141,6 @@ def select(
         )
     )
     return df, fin.join(top, on=["case", "scheduler"], how="left")
-
-
-def finals(df: pl.DataFrame) -> pl.DataFrame:
-    """One row per run: final cost, the run's best final cost, resources to reach it."""
-    last = df.group_by(KEY, maintain_order=True).last()
-    last = last.with_columns(best=pl.col("cost").min().over("case", "run"))
-
-    reached = (
-        df.join(last.select(*KEY, "best"), on=KEY)
-        .filter(pl.col("cost") <= pl.col("best"))
-        .group_by(KEY, maintain_order=True)
-        .first()
-        .select(*KEY, *(pl.col(r).alias(f"{r}_to_best") for r in RESOURCES))
-    )
-    return last.join(reached, on=KEY, how="left")
 
 
 def check_runs(df: pl.DataFrame, *, schedulers: Sequence[Scheduler] = SCHEDULERS):
@@ -188,18 +184,6 @@ def _facets(by: str, n: int, scales: Literal["free", "free_x"]) -> p9.facet_wrap
     )
 
 
-def _stars(d: pl.DataFrame, by: list[str], y: str) -> pl.DataFrame:
-    """First point per group and scheduler where `y` reaches its final value."""
-    group = [*by, "scheduler"]
-    last = pl.col(y).last().over(group)
-    return (
-        d.sort("x", maintain_order=True)
-        .filter((pl.col(y) - last).abs() <= 1e-9 * last.abs())
-        .group_by(group)
-        .first()
-    )
-
-
 def _steps(
     d: pl.DataFrame,
     fin: pl.DataFrame,
@@ -217,7 +201,16 @@ def _steps(
     top = d.filter(pl.col("top"))
     # legend with only the sides present
     breaks = [side for side in COLORS if side in d["side"]]
-    stars = _stars(d, by, y).filter(star_if & pl.col("top"))
+    # the first point per group and scheduler where `y` reaches its final value
+    group = [*by, "scheduler"]
+    last = pl.col(y).last().over(group)
+    stars = (
+        d.sort("x", maintain_order=True)
+        .filter((pl.col(y) - last).abs() <= 1e-9 * last.abs())
+        .group_by(group)
+        .first()
+        .filter(star_if & pl.col("top"))
+    )
     return (
         p9.ggplot(d, p9.aes("x", y, color="side", group="scheduler"))
         + p9.geom_step(data=d.filter(~pl.col("top")), size=0.5, alpha=REST_ALPHA)
@@ -377,34 +370,6 @@ def _per_resource(df: pl.DataFrame, *cols: str) -> pl.DataFrame:
     )
 
 
-def _profile(
-    points: pl.DataFrame,
-    ends: pl.DataFrame,
-    fin: pl.DataFrame,
-    log_x: bool,
-    y_min: float,
-    y_max: float,
-    *,
-    nrow: int = len(RESOURCES),
-) -> p9.ggplot:
-    """Step curves from 0 at `lo` through `points` to `hi`, y from `y_min` to `y_max`."""
-    group = ["case", "resource", "scheduler"]
-    curves = pl.concat(
-        [
-            ends.select(*group, x="lo", y=pl.lit(0.0)),
-            points.select(*group, "x", "y"),
-            ends.select(*group, x="hi", y="y"),
-        ]
-    ).sort("x", maintain_order=True)
-    curves = _titled(curves, fin)
-    return (
-        # curves that stay at 0 get no star
-        _steps(curves, fin, "y", ["case", "resource"], log_x, star_if=pl.col("y") > 0)
-        + _facets("resource", nrow, "free_x")
-        + p9.coord_cartesian(ylim=(y_min, y_max))
-    )
-
-
 def solved_profile(
     df: pl.DataFrame,
     schedulers: Sequence[Scheduler] = SCHEDULERS,
@@ -439,14 +404,29 @@ def solved_profile(
         .join(proofs.group_by(group).agg(pl.col("y").max()), on=group, how="left")
         .with_columns(pl.col("y").fill_null(0))
     )
-    # few proof cases, so the resources go side by side
-    return _profile(proofs, ends, fin, log_x, y_min, y_max, nrow=1) + p9.labs(
-        x="",
-        y="runs with a proof",
-        title="Proving the goal",
-        subtitle="fraction of runs that proved the goal within a time / e-graph size"
-        " budget; higher is better;\na curve ends at the most its scheduler used,"
-        f" ★ marks its last proof;\n{TOP_NOTE}",
+    # step curves from 0 at `lo` through the proofs to `hi`
+    curves = pl.concat(
+        [
+            ends.select(*group, x="lo", y=pl.lit(0.0)),
+            proofs.select(*group, "x", "y"),
+            ends.select(*group, x="hi", y="y"),
+        ]
+    ).sort("x", maintain_order=True)
+    curves = _titled(curves, fin)
+    return (
+        # curves that stay at 0 get no star
+        _steps(curves, fin, "y", ["case", "resource"], log_x, star_if=pl.col("y") > 0)
+        # few proof cases, so the resources go side by side
+        + _facets("resource", 1, "free_x")
+        + p9.coord_cartesian(ylim=(y_min, y_max))
+        + p9.labs(
+            x="",
+            y="runs with a proof",
+            title="Proving the goal",
+            subtitle="fraction of runs that proved the goal within a time / e-graph"
+            " size budget; higher is better;\na curve ends at the most its scheduler"
+            f" used, ★ marks its last proof;\n{TOP_NOTE}",
+        )
     )
 
 
