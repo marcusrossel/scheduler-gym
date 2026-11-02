@@ -1,4 +1,4 @@
-benchdata
+benchdata*
 .direnv
 figures/
 __pycache__/
