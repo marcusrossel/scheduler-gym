@@ -218,7 +218,7 @@ def ranking(df: pl.DataFrame, schedulers: Sequence[Shown] = SCHEDULERS) -> p9.gg
 
 
 def sums(df: pl.DataFrame, schedulers: Sequence[Shown] = SCHEDULERS) -> p9.ggplot:
-    """Sum of the final cost, time and size over all runs, like dump.py's dumpall."""
+    """Sum of the final cost, time and size over all runs."""
     _, fin = select(df, schedulers)
     d = pl.concat(
         fin.group_by("case", "scheduler").agg(

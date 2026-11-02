@@ -1,4 +1,4 @@
-"""Schedulers and case studies, shared by bench.py and helpers.py (bench.sh has its own copy). Keep this free of dependencies."""
+"""Schedulers and case studies, shared by bench.py and helpers.py. Keep this free of dependencies."""
 
 from typing import Literal, get_args
 
