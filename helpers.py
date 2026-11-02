@@ -383,10 +383,11 @@ def _profile(
     fin: pl.DataFrame,
     log_x: bool,
     y_min: float,
+    y_max: float,
     *,
     nrow: int = len(RESOURCES),
 ) -> p9.ggplot:
-    """Step curves from 0 at `lo` through `points` to `hi`, y from `y_min` to 1."""
+    """Step curves from 0 at `lo` through `points` to `hi`, y from `y_min` to `y_max`."""
     group = ["case", "resource", "scheduler"]
     curves = pl.concat(
         [
@@ -400,7 +401,7 @@ def _profile(
         # curves that stay at 0 get no star
         _steps(curves, fin, "y", ["case", "resource"], log_x, star_if=pl.col("y") > 0)
         + _facets("resource", nrow, "free_x")
-        + p9.coord_cartesian(ylim=(y_min, 1))
+        + p9.coord_cartesian(ylim=(y_min, y_max))
     )
 
 
@@ -411,9 +412,10 @@ def solved_profile(
     solved_cost: float = 1,
     log_x: bool = False,
     y_min: float = 0,
+    y_max: float = 1,
 ) -> p9.ggplot:
     """Fraction of runs that reached `solved_cost` within a resource budget.
-    `log_x`: log x axis; `y_min`: lower end of the y axis, to zoom in on high fractions."""
+    `log_x`: log x axis; `y_min`, `y_max`: ends of the y axis, to zoom in on a range."""
     df, fin = select(df, schedulers=schedulers)
     group = ["case", "resource", "scheduler"]
     d = _per_resource(df, "cost")
@@ -438,7 +440,7 @@ def solved_profile(
         .with_columns(pl.col("y").fill_null(0))
     )
     # few proof cases, so the resources go side by side
-    return _profile(proofs, ends, fin, log_x, y_min, nrow=1) + p9.labs(
+    return _profile(proofs, ends, fin, log_x, y_min, y_max, nrow=1) + p9.labs(
         x="",
         y="runs with a proof",
         title="Proving the goal",
