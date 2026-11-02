@@ -44,6 +44,10 @@
             ruff
             ty
             uv
+            # benchmarking: taskset (bench.py pins case studies), monitoring tools
+            util-linux
+            linuxPackages.turbostat
+            lm_sensors
           ]);
 
           # szalinski's default make target converts inputs with openscad.
