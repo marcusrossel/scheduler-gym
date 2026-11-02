@@ -86,11 +86,7 @@ def load(root: Path = BENCHDATA) -> pl.DataFrame:
 
 
 def select(
-    df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
-    *,
-    solved_case: str = "caviar",
-    solved_cost: float = 1,
+    df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """The rows and `finals` of `schedulers`, ordered as given (fixes order in figures),
     the finals with each scheduler's `side` and whether it is the `top` of it per case."""
@@ -100,16 +96,11 @@ def select(
     fin = finals(df)
     name = pl.col("scheduler").cast(pl.String)
     side = name.str.extract(r"^detour-(lhs|rhs)-\d+$")
-    # backoff is always top; of lhs / rhs the best as in `ranking` (solved runs first),
-    # ties going to the smallest k
+    # backoff is always top; of lhs / rhs the best as in `ranking`, ties going to the
+    # smallest k
     top = (
         fin.group_by("case", "scheduler")
-        .agg(
-            ratio=_geomean(pl.col("cost") / pl.col("best")),
-            solved=(
-                (pl.col("case") == solved_case) & (pl.col("cost") == solved_cost)
-            ).sum(),
-        )
+        .agg(ratio=_geomean(pl.col("cost") / pl.col("best")))
         .with_columns(
             side=pl.when(name == "backoff")
             .then(pl.lit("backoff"))
@@ -117,7 +108,7 @@ def select(
             .cast(SIDE),
             k=name.str.extract(r"-(\d+)$").cast(pl.Int64),
         )
-        .sort("solved", "ratio", "k", descending=[True, False, False])
+        .sort("ratio", "k")
         .select(
             "case",
             "scheduler",
@@ -296,23 +287,22 @@ def solved(
     df: pl.DataFrame,
     schedulers: Sequence[Scheduler] = SCHEDULERS,
     *,
-    case: str = "caviar",
     solved_cost: float = 1,
 ) -> p9.ggplot:
-    """Number of runs per scheduler that ended at `solved_cost`, i.e. proved the goal."""
-    _, fin = select(df, schedulers, solved_case=case, solved_cost=solved_cost)
-    d = (
-        fin.filter(pl.col("case") == case)
-        .group_by("case", "scheduler")
-        .agg(solved=(pl.col("cost") == solved_cost).sum(), runs=pl.len())
+    """Number of runs per scheduler that ended at `solved_cost`, i.e. proved the goal, per
+    case of `df`, which are all proof cases."""
+    _, fin = select(df, schedulers)
+    d = fin.group_by("case", "scheduler").agg(
+        solved=(pl.col("cost") == solved_cost).sum(), runs=pl.len()
     )
-    runs = d["runs"].max()
     return (
-        _bars(d, fin, "solved", "d")
-        + p9.expand_limits(x=runs)
+        _bars(_titled(d, fin), fin, "solved", "d")
+        # each case's axis reaches its number of runs
+        + p9.geom_blank(p9.aes(x="runs"))
+        + p9.facet_wrap("title", nrow=1, scales="free")
         + p9.labs(
-            x=f"solved runs (of {runs})",
-            title=f"{case}: proved goals",
+            x="solved runs",
+            title="Proved goals",
             subtitle=f"runs that ended at the goal; higher is better;\n{TOP_NOTE}",
         )
     )
@@ -362,19 +352,14 @@ def solved_profile(
     df: pl.DataFrame,
     schedulers: Sequence[Scheduler] = SCHEDULERS,
     *,
-    case: str = "caviar",
     solved_cost: float = 1,
     log_x: bool = False,
     y_min: float = 0,
 ) -> p9.ggplot:
-    """Fraction of runs per scheduler that reached `solved_cost` within a resource budget.
+    """Fraction of runs per scheduler that reached `solved_cost` within a resource budget,
+    per case of `df`, which are all proof cases.
     `log_x`: log x axis; `y_min`: lower end of the y axis, to zoom in on high fractions."""
-    df, fin = select(
-        df.filter(pl.col("case") == case),
-        schedulers,
-        solved_case=case,
-        solved_cost=solved_cost,
-    )
+    df, fin = select(df, schedulers)
     group = ["case", "resource", "scheduler"]
     d = _per_resource(df, "cost")
     runs = fin.group_by("case", "scheduler").agg(runs=pl.len())
@@ -397,11 +382,11 @@ def solved_profile(
         .join(proofs.group_by(group).agg(pl.col("y").max()), on=group, how="left")
         .with_columns(pl.col("y").fill_null(0))
     )
-    # a single case, so the resources go side by side
+    # few proof cases, so the resources go side by side
     return _profile(proofs, ends, fin, log_x, y_min, nrow=1) + p9.labs(
         x="",
         y="runs with a proof",
-        title=f"{case}: proving the goal",
+        title="Proving the goal",
         subtitle="fraction of runs that proved the goal within a time / e-graph size"
         " budget; higher is better;\na curve ends at the most its scheduler used,"
         f" ★ marks its last proof;\n{TOP_NOTE}",
