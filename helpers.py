@@ -16,6 +16,8 @@ FIGURES = ROOT / "figures"
 KEY = ("case", "scheduler", "run")
 Resource = Literal["time", "size"]
 Metric = Literal["cost", "time", "size"]
+# schedulers, or `with_best_k`'s labels
+Shown = Scheduler | Literal["lhs-best", "rhs-best"]
 
 RESOURCES: dict[Resource, str] = {"time": "time [s]", "size": "e-graph size"}
 METRICS: dict[Metric, str] = {"cost": "cost", **RESOURCES}
@@ -75,7 +77,7 @@ def load(root: Path = BENCHDATA) -> pl.DataFrame:
 
 
 def select(
-    df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS
+    df: pl.DataFrame, schedulers: Sequence[Shown] = SCHEDULERS
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """The rows and `finals` of `schedulers`, ordered as given (fixes order and colors in figures)."""
     df = df.filter(pl.col("scheduler").is_in(schedulers)).with_columns(
@@ -99,7 +101,7 @@ def finals(df: pl.DataFrame) -> pl.DataFrame:
     return last.join(reached, on=KEY, how="left")
 
 
-def check_runs(df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS):
+def check_runs(df: pl.DataFrame, schedulers: Sequence[Shown] = SCHEDULERS):
     """Print the cases where `schedulers` have a different number of finished runs."""
     _, fin = select(df, schedulers)
     counts = fin.group_by("case", "scheduler").len()
@@ -198,9 +200,7 @@ def _bars(d: pl.DataFrame, value: str, fmt: str, *, base: float = 0) -> p9.ggplo
     )
 
 
-def ranking(
-    df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS
-) -> p9.ggplot:
+def ranking(df: pl.DataFrame, schedulers: Sequence[Shown] = SCHEDULERS) -> p9.ggplot:
     """Geometric mean of final cost relative to the best scheduler per run (1 = always best)."""
     _, fin = select(df, schedulers)
     d = fin.group_by("case", "scheduler").agg(
@@ -217,7 +217,7 @@ def ranking(
     )
 
 
-def sums(df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS) -> p9.ggplot:
+def sums(df: pl.DataFrame, schedulers: Sequence[Shown] = SCHEDULERS) -> p9.ggplot:
     """Sum of the final cost, time and size over all runs, like dump.py's dumpall."""
     _, fin = select(df, schedulers)
     d = pl.concat(
@@ -239,7 +239,7 @@ def sums(df: pl.DataFrame, schedulers: Sequence[Scheduler] = SCHEDULERS) -> p9.g
 
 def solved(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[Shown] = SCHEDULERS,
     *,
     case: str = "caviar",
     solved_cost: float = 1,
@@ -260,6 +260,91 @@ def solved(
             title=f"{case}: proved goals",
             subtitle="runs that ended at the goal; higher is better",
         )
+    )
+
+
+def with_best_k(
+    df: pl.DataFrame,
+    ks: dict[str, dict[str, int]],
+    base: Sequence[Scheduler] = ("backoff",),
+) -> pl.DataFrame:
+    """`base` plus each case's detour-<side>-<k> from `ks` ({case: {side: k}}) as <side>-best."""
+    picks = {
+        f"{case}/detour-{side}-{k}": f"{side}-best"
+        for case, sides in ks.items()
+        for side, k in sides.items()
+    }
+    df = df.filter(pl.col("case").is_in(ks.keys())).with_columns(
+        pl.col("scheduler").cast(pl.String)
+    )
+    label = pl.concat_str("case", pl.lit("/"), "scheduler").replace_strict(
+        picks, default=None
+    )
+    return df.filter(
+        label.is_not_null() | pl.col("scheduler").is_in(base)
+    ).with_columns(
+        scheduler=pl.coalesce(label, "scheduler"),
+        case=pl.col("case").replace(
+            {
+                case: f"{case}: "
+                + ", ".join(f"{side} {k}" for side, k in sides.items())
+                for case, sides in ks.items()
+            }
+        ),
+    )
+
+
+def suggest_best_k(
+    df: pl.DataFrame,
+    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    *,
+    solved_case: str = "caviar",
+    solved_cost: float = 1,
+) -> pl.DataFrame:
+    """The lhs/rhs ks per case side by side, ranked as in `ranking` (by solved runs first for
+    `solved_case`, the only case with a solved count)."""
+    _, fin = select(df, schedulers)
+    side_k = (
+        pl.col("scheduler")
+        .cast(pl.String)
+        .str.extract_groups(r"^detour-(?P<side>lhs|rhs)-(?P<k>\d+)$")
+    )
+    d = (
+        fin.with_columns(
+            side=side_k.struct["side"], k=side_k.struct["k"].cast(pl.Int64)
+        )
+        .filter(pl.col("side").is_not_null())
+        .group_by("case", "side", "k")
+        .agg(
+            ratio=_geomean(pl.col("cost") / pl.col("best")),
+            solved=(
+                (pl.col("case") == solved_case) & (pl.col("cost") == solved_cost)
+            ).sum(),
+        )
+        # ties go to the smallest k
+        .sort(
+            "case",
+            "side",
+            "solved",
+            "ratio",
+            "k",
+            descending=[False, False, True, False, False],
+        )
+        .with_columns(
+            rank=pl.int_range(1, pl.len() + 1).over("case", "side"),
+            ratio=pl.col("ratio").round(3),
+            solved=pl.when(pl.col("case") == solved_case).then("solved"),
+        )
+    )
+    sides = d["side"].unique(maintain_order=True)
+    return (
+        d.pivot(on="side", index=["case", "rank"], values=["k", "ratio", "solved"])
+        .select(
+            "case",
+            "rank",
+            *(f"{c}_{side}" for side in sides for c in ("k", "ratio", "solved")),
+        )
+        .sort("case", "rank", maintain_order=True)
     )
 
 
@@ -305,7 +390,7 @@ def _profile(
 
 def solved_profile(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[Shown] = SCHEDULERS,
     *,
     case: str = "caviar",
     solved_cost: float = 1,
@@ -350,7 +435,7 @@ def solved_profile(
 
 def profile(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[Shown] = SCHEDULERS,
     *,
     log_x: bool = False,
     y_min: float = 0,
@@ -424,7 +509,7 @@ def _geomean_curves(d: pl.DataFrame, by: list[str], grid: pl.DataFrame) -> pl.Da
 
 def quality(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[Shown] = SCHEDULERS,
     *,
     log_x: bool = False,
     log_y: bool = False,
@@ -457,7 +542,7 @@ def quality(
 
 def dev(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[Shown] = SCHEDULERS,
     *,
     log_x: bool = False,
     log_y: bool = False,
