@@ -43,10 +43,16 @@ BREAK = MplPath(
     [(-0.6, -1), (-0.1, 1), (0.1, -1), (0.6, 1)],
     [MplPath.MOVETO, MplPath.LINETO, MplPath.MOVETO, MplPath.LINETO],
 )
-TOP_NOTE = "opaque: backoff and the lhs / rhs with the lowest final cost of each case"
+# how the baseline is called in the plot texts
+BASELINE_NAME = "BackoffScheduler"
+MODES = "for each mode (lhs/rhs/class)"
+TOP_NOTE = (
+    f"{BASELINE_NAME} and the k with the lowest final cost per benchmark {MODES}"
+    " marked opaque"
+)
 BAR_NOTE = (
-    "opaque: the lhs / rhs with the lowest final cost of each case;\n"
-    f"// = bar cut off; the line at 0 is {BASELINE}"
+    f"k with the lowest final cost per benchmark {MODES} marked opaque;\n"
+    f"// marks bar cut off; the line at 0 is {BASELINE_NAME}"
 )
 
 RESOURCES: dict[Resource, str] = {"time": "time [s]", "size": "e-graph size"}
@@ -246,7 +252,12 @@ def _steps(
             show_legend=False,
         )
         + (p9.scale_x_log10() if log_x else p9.scale_x_continuous())
-        + p9.scale_color_manual(values=COLORS, breaks=breaks, name="scheduler")
+        + p9.scale_color_manual(
+            values=COLORS,
+            breaks=breaks,
+            labels=[BASELINE_NAME if s == BASELINE else s for s in breaks],
+            name="scheduler",
+        )
         + p9.scale_fill_manual(values=COLORS, breaks=breaks)
     )
 
@@ -327,10 +338,10 @@ def ranking(
         _bars(_titled(d, fin), "gain", zoom=zoom)
         + p9.facet_wrap("title", nrow=1, scales="free")
         + p9.labs(
-            x=f"final cost reduction over {BASELINE} [%]",
-            title=f"Final cost relative to {BASELINE}",
-            subtitle=f"1 − geomean over runs of final cost / {BASELINE}'s final cost;"
-            f" higher is better;\n{BAR_NOTE}",
+            x=f"final cost reduction over {BASELINE_NAME} [%]",
+            title=f"Final cost relative to {BASELINE_NAME}",
+            subtitle=f"1 − geomean over runs of final cost / {BASELINE_NAME}'s final"
+            f" cost;\n{BAR_NOTE}; higher is better",
         )
     )
 
@@ -457,11 +468,11 @@ def solved_profile(
         + p9.labs(
             x="",
             y="runs with a proof",
-            title="Proving the goal",
-            subtitle="fraction of runs that proved the goal within a time / e-graph"
-            " size budget; higher is better;\na curve ends at the most its scheduler"
-            " used, ★ marks its last proof;\nopaque: backoff and the lhs / rhs with"
-            " the most proofs, ties going to the smallest budget of the last one",
+            title="Fraction of problems proven within a time / e-graph size budget",
+            subtitle=f"{BASELINE_NAME} and the k with the most proofs for each mode"
+            " (lhs/rhs/class,\nties go to the smaller budget at the last proof)"
+            " marked opaque;\n"
+            "★ marks the last proof found; higher is better",
         )
     )
 
@@ -528,8 +539,8 @@ def quality(
                 if absolute
                 else "cost relative to the best final cost of each run"
             )
-            + ", geometric mean over runs; lower is better;"
-            f"\n★ marks where a curve stops improving; {TOP_NOTE}",
+            + f", geometric mean over runs;\n{TOP_NOTE};"
+            "\n★ marks where a curve stops improving; lower is better",
         )
     )
 
@@ -570,7 +581,7 @@ def dev(
             title="Development per iteration",
             subtitle="cost, time and e-graph size"
             + ("" if absolute else " relative to the smallest final value of each run")
-            + ", geometric mean over runs; lower is better;"
-            f"\n★ marks where the cost stops improving; {TOP_NOTE}",
+            + f", geometric mean over runs;\n{TOP_NOTE};"
+            "\n★ marks where the cost stops improving; lower is better",
         )
     )
