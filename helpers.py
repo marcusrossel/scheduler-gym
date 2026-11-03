@@ -30,9 +30,7 @@ _NAME = pl.col("scheduler").cast(pl.String)
 SIDE_OF = (
     pl.when(_NAME == "backoff")
     .then(pl.lit("backoff"))
-    .when(_NAME.str.contains(r"^detour-classbased-\d+$"))
-    .then(pl.lit("class"))
-    .otherwise(_NAME.str.extract(r"^detour-(lhs|rhs)-\d+$").fill_null("other"))
+    .otherwise(_NAME.str.extract(r"^detour-(lhs|rhs|class)-\d+$").fill_null("other"))
     .cast(SIDE)
 )
 K_OF = _NAME.str.extract(r"-(\d+)$").cast(pl.Int64)
@@ -287,12 +285,6 @@ def _steps(
     )
 
 
-def _short(scheduler: str) -> str:
-    """`scheduler` as mode and k, e.g. detour-classbased-400 as class 400."""
-    m = re.fullmatch(r"detour-(lhs|rhs|classbased)-(\d+)", scheduler)
-    return f"{m[1].removesuffix('based')} {m[2]}" if m else scheduler
-
-
 def _bars(d: pl.DataFrame, value: str, *, zoom: float = 100) -> p9.ggplot:
     """Bars of `value` per scheduler, cut at ±`zoom` with a // break.
     Backoff is left out, it is the line at 0."""
@@ -340,7 +332,11 @@ def _bars(d: pl.DataFrame, value: str, *, zoom: float = 100) -> p9.ggplot:
             labels=lambda xs: [f"{x:+.3g}%" if x else "0%" for x in xs],
             expand=(0.02, 0),
         )
-        + p9.scale_y_discrete(limits=top_down, labels=[_short(s) for s in top_down])
+        + p9.scale_y_discrete(
+            limits=top_down,
+            # detour-class-400 -> class 400
+            labels=[s.removeprefix("detour-").replace("-", " ") for s in top_down],
+        )
         + p9.scale_color_manual(values=COLORS)
         + p9.guides(color="none")
         + p9.labs(y="")
