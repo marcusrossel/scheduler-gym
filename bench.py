@@ -10,13 +10,14 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from gym import CASE_STUDIES, SCHEDULERS
-
 ROOT = Path(__file__).resolve().parent
 BENCHDATA = ROOT / "benchdata"
 SYS_CPU = Path("/sys/devices/system/cpu")
 # written by `benchmode.sh on`
 BENCHMODE_CPUS = Path("/run/benchmode/bench-cpus")
+# every scheduler in schedulers/, without the .rs suffix
+SCHEDULERS = tuple(sorted(p.stem for p in (ROOT / "schedulers").glob("*.rs")))
+CASE_STUDIES = ("caviar", "szalinski", "trig", "integ")
 
 
 def physical_cpus() -> list[list[int]]:

@@ -8,7 +8,7 @@ import plotnine as p9
 import polars as pl
 from matplotlib.path import Path as MplPath
 
-from gym import SCHEDULERS, Scheduler
+from bench import SCHEDULERS
 
 ROOT = Path(__file__).resolve().parent
 BENCHDATA = ROOT / "benchdata"
@@ -38,7 +38,7 @@ SIDE_OF = (
 K_OF = _NAME.str.extract(r"-(\d+)$").cast(pl.Int64)
 DETOUR = pl.col("side").is_in(["lhs", "rhs", "class"])
 # the scheduler the bar charts are relative to
-BASELINE: Scheduler = "backoff"
+BASELINE = "backoff"
 # alpha of the curves and bars that are not the best of their side
 REST_ALPHA = 0.4
 # marker for the break in cut bars: two slanted parallel strokes, like //
@@ -125,7 +125,7 @@ def load(*, root: Path = BENCHDATA) -> pl.DataFrame:
 
 
 def select(
-    df: pl.DataFrame, *, schedulers: Sequence[Scheduler] = SCHEDULERS
+    df: pl.DataFrame, *, schedulers: Sequence[str] = SCHEDULERS
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Rows of `schedulers` in that order, and finals: one row per run with the final
     cost, the run's best final cost, resources to reach it, `side` and `top`."""
@@ -155,7 +155,7 @@ def select(
     return df, fin.join(top, on=["case", "scheduler"], how="left")
 
 
-def check_runs(df: pl.DataFrame, *, schedulers: Sequence[Scheduler] = SCHEDULERS):
+def check_runs(df: pl.DataFrame, *, schedulers: Sequence[str] = SCHEDULERS):
     """Print cases where `schedulers` have different numbers of finished runs."""
     _, fin = select(df, schedulers=schedulers)
     counts = fin.group_by("case", "scheduler").len()
@@ -354,7 +354,7 @@ def _bars(d: pl.DataFrame, value: str, *, zoom: float = 100) -> p9.ggplot:
 
 def ranking(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[str] = SCHEDULERS,
     *,
     zoom: float = 100,
 ) -> p9.ggplot:
@@ -383,7 +383,7 @@ def ranking(
 
 def solved(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[str] = SCHEDULERS,
     *,
     solved_cost: float = 1,
     zoom: float = 100,
@@ -442,7 +442,7 @@ def _per_resource(df: pl.DataFrame, *cols: str) -> pl.DataFrame:
 
 def solved_profile(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[str] = SCHEDULERS,
     *,
     solved_cost: float = 1,
     log_x: bool = False,
@@ -549,7 +549,7 @@ def _geomean_curves(d: pl.DataFrame, by: list[str], grid: pl.DataFrame) -> pl.Da
 
 def quality(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[str] = SCHEDULERS,
     *,
     log_x: bool = False,
     log_y: bool = False,
@@ -582,7 +582,7 @@ def quality(
 
 def dev(
     df: pl.DataFrame,
-    schedulers: Sequence[Scheduler] = SCHEDULERS,
+    schedulers: Sequence[str] = SCHEDULERS,
     *,
     log_x: bool = False,
     log_y: bool = False,
