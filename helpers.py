@@ -11,7 +11,7 @@ from matplotlib.path import Path as MplPath
 from gym import SCHEDULERS, Scheduler
 
 ROOT = Path(__file__).resolve().parent
-BENCHDATA = ROOT / "benchdata-old"
+BENCHDATA = ROOT / "benchdata"
 FIGURES = ROOT / "figures"
 
 KEY = ("case", "scheduler", "run")
