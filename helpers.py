@@ -17,23 +17,26 @@ FIGURES = ROOT / "figures"
 KEY = ("case", "scheduler", "run")
 Resource = Literal["time", "size"]
 Metric = Literal["cost", "time", "size"]
-Side = Literal["backoff", "lhs", "rhs", "other"]
+Side = Literal["backoff", "lhs", "rhs", "class", "other"]
 COLORS: dict[Side, str] = {
     "backoff": "black",
-    "lhs": "#E69F00",
-    "rhs": "#0072B2",
-    "other": "#CC79A7",
-}
+    "lhs": "#E69F00",  # orange
+    "rhs": "#0072B2",  # blue
+    "class": "#009E73",  # bluish green
+    "other": "#CC79A7",  # reddish purple
+}  # Okabe-Ito colorblind-safe palette
 SIDE = pl.Enum(COLORS.keys())
 _NAME = pl.col("scheduler").cast(pl.String)
 SIDE_OF = (
     pl.when(_NAME == "backoff")
     .then(pl.lit("backoff"))
+    .when(_NAME.str.contains(r"^detour-classbased-\d+$"))
+    .then(pl.lit("class"))
     .otherwise(_NAME.str.extract(r"^detour-(lhs|rhs)-\d+$").fill_null("other"))
     .cast(SIDE)
 )
 K_OF = _NAME.str.extract(r"-(\d+)$").cast(pl.Int64)
-DETOUR = pl.col("side").is_in(["lhs", "rhs"])
+DETOUR = pl.col("side").is_in(["lhs", "rhs", "class"])
 # the scheduler the bar charts are relative to
 BASELINE: Scheduler = "backoff"
 # alpha of the curves and bars that are not the best of their side
@@ -140,7 +143,7 @@ def select(
     )
     fin = fin.join(reached, on=KEY, how="left")
 
-    # backoff is always top; of lhs / rhs the one with the lowest geomean of final cost
+    # backoff is always top; of each mode the one with the lowest geomean of final cost
     # relative to the best final cost of each run, ties going to the smallest k
     top = (
         fin.group_by("case", "scheduler")
@@ -167,7 +170,7 @@ def _geomean(e: pl.Expr) -> pl.Expr:
 
 
 def _top(*over: str) -> pl.Expr:
-    """Backoff, and of lhs / rhs the first row per `over` and side."""
+    """Backoff, and of each mode the first row per `over` and side."""
     return (
         pl.when(DETOUR)
         .then(pl.int_range(pl.len()).over(*over, "side") == 0)
@@ -176,29 +179,51 @@ def _top(*over: str) -> pl.Expr:
 
 
 def _titled(
-    d: pl.DataFrame, fin: pl.DataFrame, tops: pl.DataFrame | None = None
+    d: pl.DataFrame,
+    fin: pl.DataFrame,
+    tops: pl.DataFrame | None = None,
+    *,
+    picks: bool = True,
 ) -> pl.DataFrame:
-    """`d` with `side`, `top` and a facet `title`: case, runs, top lhs / rhs.
-    `tops`: `side` and `top` per scheduler and further keys, instead of `fin`'s."""
+    """`d` with `side`, `top` and a facet `title`: case, runs, top k of each mode.
+    `tops`: `side` and `top` per scheduler and further keys, instead of `fin`'s;
+    `picks`: whether the title lists the top k, bar charts show them anyway."""
     if tops is None:
         tops = fin.select("case", "scheduler", "side", "top").unique()
     by = [c for c in tops.columns if c not in ("scheduler", "side", "top")]
     top = pl.col("top") & DETOUR
-    pick = _NAME.str.replace(r"^detour-(\w+)-", "$1 ")
+    pick = pl.format("{} {}", pl.col("side").cast(pl.String), K_OF)
     runs = fin.group_by("case").agg(runs=pl.col("run").n_unique())
     titles = (
         tops.join(runs, on="case")
         .group_by(by)
         .agg(
+            # the top picks on a line of their own, they don't fit next to the case
             title=pl.format(
-                "{} ({} runs) · {}",
+                "{} ({} runs)\n{}",
                 pl.col("case").first(),
                 pl.col("runs").first(),
-                pick.filter(top).unique().sort().str.join(", "),
-            ).str.strip_suffix(" · ")
+                pick.filter(top)
+                .sort_by(pl.col("side").filter(top), K_OF.filter(top))
+                .unique(maintain_order=True)
+                .str.join(", ")
+                if picks
+                else pl.lit(""),
+            ).str.strip_suffix("\n")
         )
     )
     return d.join(tops, on=[*by, "scheduler"]).join(titles, on=by)
+
+
+class _Strip(p9.labeller):
+    """Facet label: the title's first line · the other facet values, then the rest of
+    the title, so the top picks keep their own line."""
+
+    def __call__(self, label_info):
+        title, *rest = label_info.variables.values()
+        head, nl, picks = title.partition("\n")
+        label_info.variables = {"title": " · ".join([head, *rest]) + nl + picks}
+        return label_info
 
 
 def _facets(by: str, n: int, scales: Literal["free", "free_x"]) -> p9.facet_wrap:
@@ -209,7 +234,7 @@ def _facets(by: str, n: int, scales: Literal["free", "free_x"]) -> p9.facet_wrap
         dir="v",
         scales=scales,
         # plotnine annotates `labeller` too narrowly, facet accepts any labeller
-        labeller=p9.labeller(multi_line=False),  # ty: ignore[invalid-argument-type]
+        labeller=_Strip(),  # ty: ignore[invalid-argument-type]
     )
 
 
@@ -262,6 +287,12 @@ def _steps(
     )
 
 
+def _short(scheduler: str) -> str:
+    """`scheduler` as mode and k, e.g. detour-classbased-400 as class 400."""
+    m = re.fullmatch(r"detour-(lhs|rhs|classbased)-(\d+)", scheduler)
+    return f"{m[1].removesuffix('based')} {m[2]}" if m else scheduler
+
+
 def _bars(d: pl.DataFrame, value: str, *, zoom: float = 100) -> p9.ggplot:
     """Bars of `value` per scheduler, cut at ±`zoom` with a // break.
     Backoff is left out, it is the line at 0."""
@@ -309,11 +340,15 @@ def _bars(d: pl.DataFrame, value: str, *, zoom: float = 100) -> p9.ggplot:
             labels=lambda xs: [f"{x:+.3g}%" if x else "0%" for x in xs],
             expand=(0.02, 0),
         )
-        + p9.scale_y_discrete(limits=top_down)
+        + p9.scale_y_discrete(limits=top_down, labels=[_short(s) for s in top_down])
         + p9.scale_color_manual(values=COLORS)
         + p9.guides(color="none")
         + p9.labs(y="")
-        + p9.theme(panel_grid_major_y=p9.element_blank())
+        + p9.theme(
+            panel_grid_major_y=p9.element_blank(),
+            # left aligned, so the modes line up and the k are easier to compare
+            axis_text_y=p9.element_text(ha="left"),
+        )
     )
 
 
@@ -335,7 +370,7 @@ def ranking(
         .agg(gain=(1 - _geomean(pl.col("cost") / pl.col("base"))) * 100)
     )
     return (
-        _bars(_titled(d, fin), "gain", zoom=zoom)
+        _bars(_titled(d, fin, picks=False), "gain", zoom=zoom)
         + p9.facet_wrap("title", nrow=1, scales="free")
         + p9.labs(
             x=f"final cost reduction over {BASELINE_NAME} [%]",
@@ -368,7 +403,7 @@ def solved(
     d = d.join(base, on="case").with_columns(
         gain=(pl.col("solved") / pl.col("base") - 1) * 100
     )
-    # of lhs / rhs, all with the most proofs are top
+    # of each mode, all with the most proofs are top
     most = pl.col("solved").filter(DETOUR).max().over("case", "side")
     tops = d.with_columns(side=SIDE_OF).select(
         "case",
@@ -379,14 +414,14 @@ def solved(
         .otherwise(pl.col("side") == "backoff"),
     )
     return (
-        _bars(_titled(d, fin, tops), "gain", zoom=zoom)
+        _bars(_titled(d, fin, tops, picks=False), "gain", zoom=zoom)
         + p9.facet_wrap("title", nrow=1, scales="free")
         + p9.labs(
             x=f"more solved runs than {BASELINE} [%]",
             title="Proved goals",
             subtitle=f"runs that proved the goal, relative to {BASELINE}'s;\n"
             f"{BASELINE} solved {bases}; higher is better;\n"
-            "opaque: the lhs / rhs with the most proofs of each case;\n"
+            f"the k with the most proofs per benchmark {MODES} marked opaque;\n"
             f"// = bar cut off; the line at 0 is {BASELINE}",
         )
     )
@@ -453,7 +488,7 @@ def solved_profile(
             ends.select(*group, x="hi", y="y"),
         ]
     ).sort("x", maintain_order=True)
-    # backoff is always top; per resource, of lhs / rhs the one with the most proofs,
+    # backoff is always top; per resource, of each mode the one with the most proofs,
     # ties going to the smallest budget of the last proof, then to the smallest k
     tops = ends.sort(
         "n", "last", K_OF, descending=[True, False, False], nulls_last=True
