@@ -22,9 +22,18 @@ COLORS: dict[Side, str] = {
     "backoff": "black",
     "lhs": "#E69F00",
     "rhs": "#0072B2",
-    "other": "#999999",
+    "other": "#CC79A7",
 }
 SIDE = pl.Enum(COLORS.keys())
+_NAME = pl.col("scheduler").cast(pl.String)
+SIDE_OF = (
+    pl.when(_NAME == "backoff")
+    .then(pl.lit("backoff"))
+    .otherwise(_NAME.str.extract(r"^detour-(lhs|rhs)-\d+$").fill_null("other"))
+    .cast(SIDE)
+)
+K_OF = _NAME.str.extract(r"-(\d+)$").cast(pl.Int64)
+DETOUR = pl.col("side").is_in(["lhs", "rhs"])
 # the scheduler the bar charts are relative to
 BASELINE: Scheduler = "backoff"
 # alpha of the curves and bars that are not the best of their side
@@ -125,29 +134,14 @@ def select(
     )
     fin = fin.join(reached, on=KEY, how="left")
 
-    name = pl.col("scheduler").cast(pl.String)
-    side = name.str.extract(r"^detour-(lhs|rhs)-\d+$")
     # backoff is always top; of lhs / rhs the one with the lowest geomean of final cost
     # relative to the best final cost of each run, ties going to the smallest k
     top = (
         fin.group_by("case", "scheduler")
         .agg(ratio=_geomean(pl.col("cost") / pl.col("best")))
-        .with_columns(
-            side=pl.when(name == "backoff")
-            .then(pl.lit("backoff"))
-            .otherwise(side.fill_null("other"))
-            .cast(SIDE),
-            k=name.str.extract(r"-(\d+)$").cast(pl.Int64),
-        )
-        .sort("ratio", "k")
-        .select(
-            "case",
-            "scheduler",
-            "side",
-            top=pl.when(pl.col("side").is_in(["lhs", "rhs"]))
-            .then(pl.int_range(pl.len()).over("case", "side") == 0)
-            .otherwise(pl.col("side") == "backoff"),
-        )
+        .with_columns(side=SIDE_OF)
+        .sort("ratio", K_OF)
+        .select("case", "scheduler", "side", top=_top("case"))
     )
     return df, fin.join(top, on=["case", "scheduler"], how="left")
 
@@ -166,19 +160,39 @@ def _geomean(e: pl.Expr) -> pl.Expr:
     return e.log().mean().exp()
 
 
-def _titled(d: pl.DataFrame, fin: pl.DataFrame) -> pl.DataFrame:
-    """`d` with a facet `title`: case, runs, top lhs / rhs."""
-    top = pl.col("top") & pl.col("side").is_in(["lhs", "rhs"])
-    pick = pl.col("scheduler").cast(pl.String).str.replace(r"^detour-(\w+)-", "$1 ")
-    runs = fin.group_by("case").agg(
-        title=pl.format(
-            "{} ({} runs) · {}",
-            pl.col("case").first(),
-            pl.col("run").n_unique(),
-            pick.filter(top).unique().sort().str.join(", "),
-        ).str.strip_suffix(" · ")
+def _top(*over: str) -> pl.Expr:
+    """Backoff, and of lhs / rhs the first row per `over` and side."""
+    return (
+        pl.when(DETOUR)
+        .then(pl.int_range(pl.len()).over(*over, "side") == 0)
+        .otherwise(pl.col("side") == "backoff")
     )
-    return d.join(runs, on="case")
+
+
+def _titled(
+    d: pl.DataFrame, fin: pl.DataFrame, tops: pl.DataFrame | None = None
+) -> pl.DataFrame:
+    """`d` with `side`, `top` and a facet `title`: case, runs, top lhs / rhs.
+    `tops`: `side` and `top` per scheduler and further keys, instead of `fin`'s."""
+    if tops is None:
+        tops = fin.select("case", "scheduler", "side", "top").unique()
+    by = [c for c in tops.columns if c not in ("scheduler", "side", "top")]
+    top = pl.col("top") & DETOUR
+    pick = _NAME.str.replace(r"^detour-(\w+)-", "$1 ")
+    runs = fin.group_by("case").agg(runs=pl.col("run").n_unique())
+    titles = (
+        tops.join(runs, on="case")
+        .group_by(by)
+        .agg(
+            title=pl.format(
+                "{} ({} runs) · {}",
+                pl.col("case").first(),
+                pl.col("runs").first(),
+                pick.filter(top).unique().sort().str.join(", "),
+            ).str.strip_suffix(" · ")
+        )
+    )
+    return d.join(tops, on=[*by, "scheduler"]).join(titles, on=by)
 
 
 def _facets(by: str, n: int, scales: Literal["free", "free_x"]) -> p9.facet_wrap:
@@ -195,7 +209,6 @@ def _facets(by: str, n: int, scales: Literal["free", "free_x"]) -> p9.facet_wrap
 
 def _steps(
     d: pl.DataFrame,
-    fin: pl.DataFrame,
     y: str,
     by: list[str],
     log_x: bool,
@@ -203,10 +216,6 @@ def _steps(
     star_if: pl.Expr | bool = True,
 ) -> p9.ggplot:
     """Step lines per scheduler, top ones opaque, starred where final if `star_if`."""
-    d = d.join(
-        fin.select("case", "scheduler", "side", "top").unique(),
-        on=["case", "scheduler"],
-    )
     top = d.filter(pl.col("top"))
     # legend with only the sides present
     breaks = [side for side in COLORS if side in d["side"]]
@@ -242,9 +251,7 @@ def _steps(
     )
 
 
-def _bars(
-    d: pl.DataFrame, fin: pl.DataFrame, value: str, *, zoom: float = 100
-) -> p9.ggplot:
+def _bars(d: pl.DataFrame, value: str, *, zoom: float = 100) -> p9.ggplot:
     """Bars of `value` per scheduler, cut at ±`zoom` with a // break.
     Backoff is left out, it is the line at 0."""
     dtype = d["scheduler"].dtype
@@ -257,10 +264,6 @@ def _bars(
     )
     d = (
         d.filter(pl.col("scheduler") != BASELINE)
-        .join(
-            fin.select("case", "scheduler", "side", "top").unique(),
-            on=["case", "scheduler"],
-        )
         .with_columns(end=pl.col(value).clip(-zoom, zoom))
         .with_columns(
             reach=pl.col("end")
@@ -321,7 +324,7 @@ def ranking(
         .agg(gain=(1 - _geomean(pl.col("cost") / pl.col("base"))) * 100)
     )
     return (
-        _bars(_titled(d, fin), fin, "gain", zoom=zoom)
+        _bars(_titled(d, fin), "gain", zoom=zoom)
         + p9.facet_wrap("title", nrow=1, scales="free")
         + p9.labs(
             x=f"final cost reduction over {BASELINE} [%]",
@@ -354,14 +357,26 @@ def solved(
     d = d.join(base, on="case").with_columns(
         gain=(pl.col("solved") / pl.col("base") - 1) * 100
     )
+    # of lhs / rhs, all with the most proofs are top
+    most = pl.col("solved").filter(DETOUR).max().over("case", "side")
+    tops = d.with_columns(side=SIDE_OF).select(
+        "case",
+        "scheduler",
+        "side",
+        top=pl.when(DETOUR)
+        .then(pl.col("solved") == most)
+        .otherwise(pl.col("side") == "backoff"),
+    )
     return (
-        _bars(_titled(d, fin), fin, "gain", zoom=zoom)
+        _bars(_titled(d, fin, tops), "gain", zoom=zoom)
         + p9.facet_wrap("title", nrow=1, scales="free")
         + p9.labs(
             x=f"more solved runs than {BASELINE} [%]",
             title="Proved goals",
             subtitle=f"runs that proved the goal, relative to {BASELINE}'s;\n"
-            f"{BASELINE} solved {bases}; higher is better;\n{BAR_NOTE}",
+            f"{BASELINE} solved {bases}; higher is better;\n"
+            "opaque: the lhs / rhs with the most proofs of each case;\n"
+            f"// = bar cut off; the line at 0 is {BASELINE}",
         )
     )
 
@@ -410,8 +425,14 @@ def solved_profile(
         d.group_by(group)
         .agg(hi=pl.col("x").max())
         .join(lo, on=["case", "resource"])
-        .join(proofs.group_by(group).agg(pl.col("y").max()), on=group, how="left")
-        .with_columns(pl.col("y").fill_null(0))
+        .join(
+            proofs.group_by(group).agg(
+                pl.col("y").max(), n=pl.len(), last=pl.col("x").max()
+            ),
+            on=group,
+            how="left",
+        )
+        .with_columns(pl.col("y", "n").fill_null(0), side=SIDE_OF)
     )
     # step curves from 0 at `lo` through the proofs to `hi`
     curves = pl.concat(
@@ -421,10 +442,15 @@ def solved_profile(
             ends.select(*group, x="hi", y="y"),
         ]
     ).sort("x", maintain_order=True)
-    curves = _titled(curves, fin)
+    # backoff is always top; per resource, of lhs / rhs the one with the most proofs,
+    # ties going to the smallest budget of the last proof, then to the smallest k
+    tops = ends.sort(
+        "n", "last", K_OF, descending=[True, False, False], nulls_last=True
+    ).select(*group, "side", top=_top("case", "resource"))
+    curves = _titled(curves, fin, tops)
     return (
         # curves that stay at 0 get no star
-        _steps(curves, fin, "y", ["case", "resource"], log_x, star_if=pl.col("y") > 0)
+        _steps(curves, "y", ["case", "resource"], log_x, star_if=pl.col("y") > 0)
         # few proof cases, so the resources go side by side
         + _facets("resource", 1, "free_x")
         + p9.coord_cartesian(ylim=(y_min, y_max))
@@ -434,7 +460,8 @@ def solved_profile(
             title="Proving the goal",
             subtitle="fraction of runs that proved the goal within a time / e-graph"
             " size budget; higher is better;\na curve ends at the most its scheduler"
-            f" used, ★ marks its last proof;\n{TOP_NOTE}",
+            " used, ★ marks its last proof;\nopaque: backoff and the lhs / rhs with"
+            " the most proofs, ties going to the smallest budget of the last one",
         )
     )
 
@@ -489,7 +516,7 @@ def quality(
     by = ["case", "resource"]
     curves = _titled(_geomean_curves(d, by, _grid(d, by, log_x)), fin)
     return (
-        _steps(curves, fin, "rel", by, log_x)
+        _steps(curves, "rel", by, log_x)
         + _facets("resource", len(RESOURCES), "free")
         + (p9.scale_y_log10() if log_y else p9.scale_y_continuous())
         + p9.labs(
@@ -532,9 +559,7 @@ def dev(
     curves = _titled(_geomean_curves(d, by, grid), fin)
     return (
         # time and size only grow, so only the cost gets stars
-        _steps(
-            curves, fin, "rel", by, log_x, star_if=pl.col("metric") == METRICS["cost"]
-        )
+        _steps(curves, "rel", by, log_x, star_if=pl.col("metric") == METRICS["cost"])
         + _facets("metric", len(METRICS), "free")
         + (p9.scale_y_log10() if log_y else p9.scale_y_continuous())
         + p9.labs(
