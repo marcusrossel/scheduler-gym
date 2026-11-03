@@ -68,10 +68,19 @@ def setup_style():
 
 
 def save(plot: p9.ggplot, name: str, size: tuple[float, float]) -> p9.ggplot:
-    """Write `plot` to figures/`name`.pdf and return it for display."""
+    """Write `plot` to figures/`name`.pdf and return it for display.
+
+    Also writes figures/`name`-no-title.pdf without title and subtitle, for use
+    in a tex file, and prints them so they can go into the caption.
+    """
     plot += p9.theme(figure_size=size)
     FIGURES.mkdir(exist_ok=True)
     plot.save(FIGURES / f"{name}.pdf", verbose=False)
+    bare = plot + p9.theme(
+        plot_title=p9.element_blank(), plot_subtitle=p9.element_blank()
+    )
+    bare.save(FIGURES / f"{name}-no-title.pdf", verbose=False)
+    print(f"{name}\n{plot.labels.get('title', '')}\n{plot.labels.get('subtitle', '')}")
     return plot
 
 
