@@ -1,23 +1,49 @@
-fn sched_init() -> Stats { Stats::default() }
+fn sched_init() -> BackoffScheduler { BackoffScheduler::default() }
 
-fn sched_iter<'a, L: Language, N: Analysis<L>, IterData: IterationData<L, N>>(ctxt: &mut Ctxt<'a, L, N, IterData>, stats: &mut Stats) -> Result<(), StopReason> {
+fn sched_iter<'a, L: Language, N: Analysis<L>, IterData: IterationData<L, N>>(ctxt: &mut Ctxt<'a, L, N, IterData>, sched: &mut BackoffScheduler) -> Result<(), StopReason> {
     let ex = Extractor::new(&ctxt.runner.egraph, AdditiveCostFn(ctxt.cfg.cf));
     let ctxt_cost = compute_ctxt_costs(&ex, ctxt);
-    let mut classes: Vec<_> = ctxt_cost.iter().map(|(id, cost)| (*id, cost + ex.find_best_cost(*id))).collect();
-    classes.sort_by_key(|x| x.1);
-    classes.truncate(500);
 
-    let mut matches = Vec::new();
+    let mut matches: BTreeMap</*detour cost*/ Cost, Vec<(usize, Id, Subst)>> = BTreeMap::default();
 
     for (rw_i, rw) in ctxt.rws.iter().enumerate() {
-        let mm = search_backoff_rewrite(stats, ctxt, rw, classes.iter().map(|(i, _)| *i))?;
-        matches.push(mm);
-        ctxt.check_limits()?;
+        let effective_pat = rw.searcher.get_pattern_ast().unwrap();
+
+        for m in sched.search_rewrite(ctxt.runner.iterations.len(), &ctxt.runner.egraph, rw) {
+            ctxt.check_limits()?;
+
+            let lhs = m.eclass;
+            for subst in m.substs {
+                let class_cost = ex.find_best_cost(lhs);
+                let cx_cost = *ctxt_cost.get(&lhs).unwrap_or(&ctxt.cfg.unreachable_cost); // this is the cost you get from not being able to reach any root.
+                let detour_cost = cx_cost + class_cost;
+                matches.entry(detour_cost).or_insert(Vec::new()).push((rw_i, lhs, subst));
+
+                ctxt.check_limits()?;
+            }
+        }
     }
 
-    for (rw, ms) in ctxt.rws.iter().zip(matches.into_iter()) {
-        rw.apply(&mut ctxt.runner.egraph, &ms);
-        ctxt.check_limits()?;
+    let eg_data = |eg: &EGraph<_, _>| (eg.number_of_classes(), eg.total_size());
+
+    let mut counter = 0;
+
+    'outer: for (full_cost, new_apps) in matches {
+        for (rw_i, lhs, subst) in &new_apps {
+            let rw = &ctxt.rws[*rw_i];
+            let pat_ast = rw.searcher.get_pattern_ast();
+
+            let prev_data = eg_data(&ctxt.runner.egraph);
+            rw.applier.apply_one(&mut ctxt.runner.egraph, *lhs, subst, pat_ast, rw.name);
+            let post_data = eg_data(&ctxt.runner.egraph);
+
+            if prev_data != post_data {
+                counter += 1;
+                if counter >= 500 { break 'outer }
+            }
+
+            ctxt.check_limits()?;
+        }
     }
 
     ctxt.runner.egraph.rebuild();
@@ -105,51 +131,3 @@ impl<U: Ord, T: Eq> Ord for WithOrdRev<U, T> {
         self.partial_cmp(&other).unwrap()
     }
 }
-
-fn search_backoff_rewrite<'a, L: Language, N: Analysis<L>, IterData: IterationData<L, N>>(stats: &mut Stats, ctxt: &Ctxt<'_, L, N, IterData>, rw: &'a Rewrite<L, N>, classes: impl Iterator<Item=Id>) -> Result<Vec<SearchMatches<'a, L>>, StopReason> {
-    let iteration = ctxt.runner.iterations.len();
-    let egraph = &ctxt.runner.egraph;
-    let stats = stats.entry(rw.name).or_insert(RuleStats {
-        banned_until: 0,
-        times_banned: 0,
-        match_limit: 1000,
-        ban_length: 5,
-    });
-
-    if iteration < stats.banned_until { return Ok(Vec::new()) }
-
-    let threshold = stats
-        .match_limit
-        .checked_shl(stats.times_banned as u32)
-        .unwrap();
-
-    let mut matches = Vec::new();
-
-    let mut total_len = 0;
-    for c in classes {
-        let local_threshold = (threshold - matches.len()).saturating_add(1);
-        let submatches = rw.searcher.search_eclass_with_limit(&ctxt.runner.egraph, c, local_threshold);
-        total_len += submatches.iter().map(|m| m.substs.len()).sum::<usize>();
-
-        if total_len > threshold {
-            let ban_length = stats.ban_length << stats.times_banned;
-            stats.times_banned += 1;
-            stats.banned_until = iteration + ban_length;
-            return Ok(Vec::new())
-        }
-
-        matches.extend(submatches);
-    }
-
-    Ok(matches)
-}
-
-struct RuleStats {
-    banned_until: usize,
-    times_banned: usize,
-    match_limit: usize,
-    ban_length: usize,
-}
-
-type Stats = HashMap<Symbol, RuleStats>;
-
